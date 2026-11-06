@@ -1,0 +1,25 @@
+# Builds dicom-worklist-lab.zip with the lab files at its root, with no folder
+# inside, and attaches it to a release for each v* tag. Windows Extract All and
+# macOS Archive Utility then make exactly one folder, named after the ZIP.
+# The README links releases/latest/download/dicom-worklist-lab.zip.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the ZIP
+        run: |
+          zip -X dicom-worklist-lab.zip compose.yaml README.md LICENSE
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dicom-worklist-lab.zip --title "$GITHUB_REF_NAME" --notes "Download dicom-worklist-lab.zip and extract it. See the README."

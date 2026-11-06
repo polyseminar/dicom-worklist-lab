@@ -1,0 +1,152 @@
+# Polyseminar DICOM worklist lab: follow one exam from the order to the worklist to the PACS.
+# Lab use only. Load public, de-identified test data. Never load real patient data.
+# The same commands work on Windows, macOS, and Linux.
+name: dicom-worklist-lab
+
+services:
+  pacs:
+    image: orthancteam/orthanc:26.9.1
+    ports:
+      - "127.0.0.1:8042:8042"   # web interface
+      - "127.0.0.1:4242:4242"   # DICOM
+    environment:
+      ORTHANC__NAME: "DICOM worklist lab"
+      ORTHANC_PASSWORD: "orthanc"                  # user: orthanc, password: orthanc
+      OHIF_PLUGIN_ENABLED: "true"
+      DICOM_WEB_PLUGIN_ENABLED: "true"             # the OHIF viewer needs it
+      # The modality worklist: entries live in the PACS database, and each one is deleted
+      # once a complete study with its Study Instance UID has arrived
+      WORKLISTS_PLUGIN_ENABLED: "true"
+      ORTHANC__WORKLISTS__SAVE_IN_ORTHANC_DATABASE: "true"
+      ORTHANC__WORKLISTS__DELETE_WORKLISTS_ON_STABLE_STUDY: "true"
+      ORTHANC__WORKLISTS__HOUSEKEEPING_INTERVAL: "5"   # seconds between checks
+      ORTHANC__STABLE_AGE: "10"                        # a study is complete 10 s after its last image
+      ORTHANC__DICOM_ALWAYS_ALLOW_FIND_WORKLIST: "true"
+    volumes:
+      - pacs-data:/var/lib/orthanc/db
+    healthcheck:
+      test: ["CMD", "/probes/test-aliveness.py"]
+      interval: 5s
+      retries: 12
+
+  # One-off helper: downloads the public test study into the "study" volume
+  # Run with: docker compose run --rm download
+  download:
+    image: python:3.12-slim
+    profiles: ["tools"]
+    working_dir: /study
+    volumes:
+      - study:/study
+    # Install the IDC download tool, fetch one patient, list the folders
+    command:
+      - sh
+      - -c
+      - >-
+        pip install --quiet --disable-pip-version-check --root-user-action=ignore idc-index==0.12.5
+        && idc download PAN_03
+        && find ctpred_sunitinib_pannet -maxdepth 3 -type d
+
+  # One-off helper: DCMTK and three lab scripts. "order" plays the RIS;
+  # "worklist" and "scan" play a CT scanner whose DICOM AE title is CT1.
+  # Run with: docker compose run --rm tools order (then worklist, scan)
+  tools:
+    build:
+      dockerfile_inline: |
+        FROM debian:trixie-20261005-slim
+        RUN apt-get update && apt-get install -y --no-install-recommends dcmtk python3 && rm -rf /var/lib/apt/lists/*
+
+        # order: the RIS sends an HL7 order, and the lab turns it into a worklist entry on the PACS,
+        # the job an HL7-to-DICOM broker does in a hospital
+        COPY --chmod=755 <<'EOF' /usr/local/bin/order
+        #!/usr/bin/env python3
+        import base64, datetime, json, urllib.request
+
+        AUTH = 'Basic ' + base64.b64encode(b'orthanc:orthanc').decode()
+
+        def call(method, path, body=None):
+            req = urllib.request.Request('http://pacs:8042' + path, method=method, headers={'Authorization': AUTH},
+                                         data=None if body is None else json.dumps(body).encode())
+            return json.loads(urllib.request.urlopen(req).read() or 'null')
+
+        when = datetime.datetime.now().strftime('%Y%m%d%H%M')
+        # The order as the RIS sends it: HL7 version 2, message type ORM^O01 (a new order)
+        hl7 = [
+            f'MSH|^~\\&|RIS|RADIOLOGY|BROKER|RADIOLOGY|{when}||ORM^O01|{when}|P|2.5.1',
+            'PID|1||PAN_03||PAN_03|||F',
+            f'ORC|NW|A1001|||SC||^^^{when}',
+            'OBR|1|A1001||CTABDC^CT abdomen with contrast||||||||||||||A1001||||||CT',
+        ]
+        print('The RIS sends an order (HL7 ORM^O01):')
+        for line in hl7: print('  ' + line)
+        print()
+
+        # The broker reads the fields it needs from the message
+        seg = {line.split('|')[0]: line.split('|') for line in hl7}
+        pid, orc, obr = seg['PID'], seg['ORC'], seg['OBR']
+        accession, (code, procedure), start, modality = obr[18], obr[4].split('^'), orc[7].split('^')[3], obr[24]
+        if any(w['Tags'].get('AccessionNumber') == accession for w in call('GET', '/worklists/?format=Simplify')):
+            raise SystemExit(f'Accession {accession} is already on the worklist.')
+        call('POST', '/worklists/create', {'Tags': {
+            'PatientID': pid[3], 'PatientName': pid[5], 'PatientSex': pid[8],
+            'AccessionNumber': accession, 'RequestedProcedureID': code, 'RequestedProcedureDescription': procedure,
+            'ScheduledProcedureStepSequence': [{
+                'Modality': modality, 'ScheduledStationAETitle': 'CT1',
+                'ScheduledProcedureStepStartDate': start[:8], 'ScheduledProcedureStepStartTime': start[8:] + '00',
+                'ScheduledProcedureStepID': accession, 'ScheduledProcedureStepDescription': procedure}]}})
+        print(f'Worklist entry for CT1: patient {pid[5]}, accession {accession}, {procedure}')
+        EOF
+
+        # worklist: the scanner asks the PACS for its worklist, a DICOM C-FIND
+        COPY --chmod=755 <<'EOF' /usr/local/bin/worklist
+        #!/bin/sh
+        exec findscu -W -aet CT1 -aec ORTHANC pacs 4242 "$$@" \
+          -k "ScheduledProcedureStepSequence[0].ScheduledStationAETitle=CT1" \
+          -k "ScheduledProcedureStepSequence[0].Modality=CT" \
+          -k "ScheduledProcedureStepSequence[0].ScheduledProcedureStepStartDate" \
+          -k "ScheduledProcedureStepSequence[0].ScheduledProcedureStepDescription" \
+          -k PatientName -k PatientID -k PatientSex -k AccessionNumber -k StudyInstanceUID
+        EOF
+
+        # scan: the scanner takes the worklist entry, writes its patient, accession number and
+        # Study Instance UID into the images it makes, and sends them to the PACS.
+        # scan ID (for example: scan PAN03) skips the worklist: the patient ID is typed by hand
+        COPY --chmod=755 <<'EOF' /usr/local/bin/scan
+        #!/bin/sh
+        set -e
+        study=PAN_03/1.3.6.1.4.1.14519.5.2.1.149009956392071746167681310085914237108
+        out="$$(mktemp -d)"
+        cp "$$study"/*/*.dcm "$$out"/
+        tag() { dcmdump +P "$$1" "$$out/rsp0001.dcm" | sed -n 's/.*\[\(.*\)\].*/\1/p' | head -1 | sed 's/ *$$//'; }
+        if [ -z "$$1" ]; then
+          worklist -X -od "$$out" > /dev/null 2>&1
+          [ -f "$$out/rsp0001.dcm" ] || { echo "The worklist for CT1 is empty. Run order first."; exit 1; }
+          name="$$(tag PatientName)"; id="$$(tag PatientID)"; accession="$$(tag AccessionNumber)"
+          uid="$$(tag StudyInstanceUID)"; procedure="$$(tag ScheduledProcedureStepDescription)"
+          mv "$$out/rsp0001.dcm" /tmp/
+          echo "From the worklist: patient $$id, accession $$accession, $$procedure"
+        else
+          name="$$1"; id="$$1"; accession=""; procedure="CT abdomen"
+          uid="2.25.$$(python3 -c 'import uuid; print(uuid.uuid4().int)')"
+          echo "No worklist: patient ID typed by hand as $$id, no accession number"
+        fi
+        series="2.25.$$(python3 -c 'import uuid; print(uuid.uuid4().int)')"
+        today="$$(date +%Y%m%d)"; now="$$(date +%H%M%S)"
+        dcmodify -nb -q -gin \
+          -i "PatientName=$$name" -i "PatientID=$$id" -i "AccessionNumber=$$accession" \
+          -i "StudyInstanceUID=$$uid" -i "SeriesInstanceUID=$$series" -i "StudyDescription=$$procedure" \
+          -i "StudyDate=$$today" -i "SeriesDate=$$today" -i "AcquisitionDate=$$today" -i "ContentDate=$$today" \
+          -i "StudyTime=$$now" -i "StationName=CT1" "$$out"/*.dcm
+        storescu -aet CT1 -aec ORTHANC +sd pacs 4242 "$$out"
+        echo "Sent $$(ls "$$out" | wc -l) CT images to the PACS"
+        EOF
+    profiles: ["tools"]
+    depends_on:
+      pacs:
+        condition: service_healthy
+    working_dir: /study/ctpred_sunitinib_pannet
+    volumes:
+      - study:/study:ro
+
+volumes:
+  pacs-data:   # the PACS database, its worklist entries and stored images
+  study:       # the downloaded test study
