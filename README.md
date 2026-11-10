@@ -2,7 +2,9 @@
 
 Follow one CT exam through a radiology department on your own computer, for learning: the RIS sends an HL7 order, the order becomes a DICOM modality worklist entry, the scanner asks for its worklist, writes the patient and the accession number into its images, and sends them to the PACS. The lab runs an [Orthanc](https://www.orthanc-server.com/) PACS with its worklists plugin, and [DCMTK](https://dcmtk.org), the OFFIS DICOM command-line tools, as the scanner.
 
-This lab goes with the fifth Polyseminar lab video, on the radiology workflow. It follows [`pacs-lab`](https://github.com/polyseminar/pacs-lab), [`dicom-send-lab`](https://github.com/polyseminar/dicom-send-lab), [`dicom-errors-lab`](https://github.com/polyseminar/dicom-errors-lab) and [`dicom-anonymize-lab`](https://github.com/polyseminar/dicom-anonymize-lab). This one stands alone, so you don't need the others.
+This lab goes with the Polyseminar video "Radiology workflow: order to PACS, live in a lab". It is the fifth lab in the series, after [`pacs-lab`](https://github.com/polyseminar/pacs-lab), [`dicom-send-lab`](https://github.com/polyseminar/dicom-send-lab), [`dicom-errors-lab`](https://github.com/polyseminar/dicom-errors-lab) and [`dicom-anonymize-lab`](https://github.com/polyseminar/dicom-anonymize-lab). This one stands alone, so you don't need the others.
+
+The [lab page](https://polyseminar.com/labs/dicom-modality-worklist) on polyseminar.com has the video, its chapters, and the main commands.
 
 > **Lab use only.** Load only the public test data named below. Never load real patient data, including your own scans, and never point these tools at a hospital system without permission. The "RIS" and the "scanner" here are small scripts that show the messages; they are not products.
 
